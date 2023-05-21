@@ -7,7 +7,7 @@ using PALEOboxes.DocStrings
 using SpecialFunctions
 using Interpolations
 
-# import Infiltrator
+import Infiltrator
 
 """
     ReactionShelfCarb
@@ -337,6 +337,9 @@ Base.@kwdef mutable struct ReactionBurialEffCorgP{P} <: PB.AbstractReaction
         PB.ParDouble("FixedCorgBurialTotal", NaN, units="mol C yr-1",
             description="if != NaN, fix total ocean Corg burial rate by renormalizing per-cell fluxes"),
 
+        PB.ParString("PC_oxygen", "LinearInterpolation",
+            allowed_values=["LinearInterpolation", "SmoothStep"],
+            description="oxygen dependence of C:P burial ratio"),
         PB.ParDoubleVec("BPO2", [NaN], units="mol O2 m-3",
             description="[O2] points for interpolated oxygen-dependent P:Corg (length 1 for O2-independent P:Corg)"),
         PB.ParDoubleVec("BPorgCorg", [0.0], units="mol P (mol Corg)-1",
@@ -448,31 +451,38 @@ function setup_burial_eff_CorgP(
         error("setup_burial_eff_CorgP! $(PB.fullname(rj)) config error: "*
             "lengths BPO2, BPorgCorg, BPauthCorg, BPFeCorg differ")
        
-    if length(pars.BPO2) <= 1
-        # oxygen-independent - duplicate values so that interpolation -> constant
-        O2_vals = [-1.0, 1.0]
-        BPorgCorg_vals = pars.BPorgCorg[[1, 1]]
-        BPFeCorg_vals = pars.BPFeCorg[[1, 1]]
-        BPauthCorg_vals = pars.BPauthCorg[[1, 1]]
+    if pars.PC_oxygen[] == "LinearInterpolation"
+        if length(pars.BPO2) <= 1
+            # oxygen-independent - duplicate values so that interpolation -> constant
+            O2_vals = [-1.0, 1.0]
+            BPorgCorg_vals = pars.BPorgCorg[[1, 1]]
+            BPFeCorg_vals = pars.BPFeCorg[[1, 1]]
+            BPauthCorg_vals = pars.BPauthCorg[[1, 1]]
+        else
+            O2_vals = pars.BPO2.v
+            BPorgCorg_vals = pars.BPorgCorg.v
+            BPFeCorg_vals = pars.BPFeCorg.v
+            BPauthCorg_vals = pars.BPauthCorg.v
+        end
+        
+        rj.fPorgCorg = Interpolations.LinearInterpolation(
+            O2_vals, BPorgCorg_vals, 
+            extrapolation_bc=Interpolations.Flat(),
+        )
+        rj.fPFeCorg = Interpolations.LinearInterpolation(
+            O2_vals, BPFeCorg_vals, 
+            extrapolation_bc=Interpolations.Flat(),
+        )
+        rj.fPauthCorg = Interpolations.LinearInterpolation(
+            O2_vals, BPauthCorg_vals, 
+            extrapolation_bc=Interpolations.Flat(),
+        )
+    elseif pars.PC_oxygen[] == "SmoothStep"
+        length(pars.BPO2) == 2 || error("setup_burial_eff_CorgP! $(PB.fullname(rj)) config error: "*
+            "PC_oxygen='SmoothStep' requires two values for BPO2, fPorgCorg, fPFeCorg, fPauthCorg")
     else
-        O2_vals = pars.BPO2.v
-        BPorgCorg_vals = pars.BPorgCorg.v
-        BPFeCorg_vals = pars.BPFeCorg.v
-        BPauthCorg_vals = pars.BPauthCorg.v
+        error("setup_burial_eff_CorgP! $(PB.fullname(rj)) config error: invalid PC_oxygen = '$(pars.PC_oxygen[])'")
     end
-    
-    rj.fPorgCorg = Interpolations.LinearInterpolation(
-        O2_vals, BPorgCorg_vals, 
-        extrapolation_bc=Interpolations.Flat(),
-    )
-    rj.fPFeCorg = Interpolations.LinearInterpolation(
-        O2_vals, BPFeCorg_vals, 
-        extrapolation_bc=Interpolations.Flat(),
-    )
-    rj.fPauthCorg = Interpolations.LinearInterpolation(
-        O2_vals, BPauthCorg_vals, 
-        extrapolation_bc=Interpolations.Flat(),
-    )
 
     return nothing
 end
@@ -522,7 +532,21 @@ function do_burial_eff_CorgP(
 
         # P burial from burial efficiency
         O2_conc = PB.get_if_available(vars.O2_conc, i, -1.0) # not needed if oxygen-independent
-        BPorgCorg, BPFeCorg, BPauthCorg = rj.fPorgCorg(O2_conc), rj.fPFeCorg(O2_conc), rj.fPauthCorg(O2_conc)
+
+        if pars.PC_oxygen[] == "LinearInterpolation"
+            BPorgCorg, BPFeCorg, BPauthCorg = rj.fPorgCorg(O2_conc), rj.fPFeCorg(O2_conc), rj.fPauthCorg(O2_conc)
+        elseif pars.PC_oxygen[] == "SmoothStep"
+            edge = 0.5*(pars.BPO2[1] + pars.BPO2[2])
+            width = pars.BPO2[2] - pars.BPO2[1]
+            f2 = smoothstep(O2_conc, edge, width)
+            f1 = 1.0 - f2
+            BPorgCorg = f1*pars.BPorgCorg[1] + f2*pars.BPorgCorg[2]
+            BPFeCorg = f1*pars.BPFeCorg[1] + f2*pars.BPFeCorg[2]
+            BPauthCorg = f1*pars.BPauthCorg[1] + f2*pars.BPauthCorg[2]
+            @Infiltrator.infiltrate
+        else
+            @error("invalid PC_oxygen = '$(pars.PC_oxygen[])'")
+        end
         
         burial_Porg, burial_PFe, burial_Pauth = (BPorgCorg, BPFeCorg, BPauthCorg).*PB.get_total(burial_Corg)        
         burial_P        = burial_Porg + burial_PFe + burial_Pauth
@@ -540,6 +564,29 @@ function do_burial_eff_CorgP(
     end
 
     return nothing
+end
+
+"""
+    smoothstep(x, xedge, xwidth) -> y
+
+Smoothed step function over width `xwidth` at location `xedge`.
+
+Returns:
+    - 0.0 for x < (xedge - xwidth/2)
+    - 1.0 for x > (xedge + xwidth/2)
+    - a smoothed step fo xedge-xwidth/2 < x < xedge+xwidth/2 (first derivative is continuous, higher derivatives are not)
+"""
+function smoothstep(x, xedge, xwidth)
+    # rescale to 0 < xs < 1
+    xs = (x - xedge + 0.5*xwidth)/xwidth
+    # xs smoothly steps from 0 to 1 over interval 0 < xs < 1
+    if xs >= 1.0
+        return one(xs)
+    elseif xs < 0.0
+        return zero(xs)
+    else
+        return xs*xs*(3 - 2 * xs)
+    end
 end
 
 """
